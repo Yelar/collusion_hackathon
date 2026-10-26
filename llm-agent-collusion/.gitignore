@@ -194,3 +194,12 @@ pr-*.txt
 # Hackathon
 uv.lock.bak
 results/
+
+# monitor_arrives: report drafts, review notes and generated outputs stay out of the repo (README and code only)
+experiments/monitor_arrives/*.md
+!experiments/monitor_arrives/README.md
+experiments/monitor_arrives/*.docx
+experiments/monitor_arrives/*.pdf
+experiments/monitor_arrives/figures/*.png
+experiments/monitor_arrives/figures/*.pdf
+experiments/monitor_arrives/figures/data.json

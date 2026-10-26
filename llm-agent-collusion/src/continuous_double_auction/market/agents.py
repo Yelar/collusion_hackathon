@@ -75,6 +75,7 @@ class ZIPBuyer(Agent):
         momentum: A factor that incorporates previous adjustments to smooth the learning process.
         last_adjustment: The value of the previous adjustment applied to the profit margin.
         random_noise: A small random value added to the bid to break symmetry between identical buyers.
+        no_trade_step: How far the target margin drops after an hour in which nothing traded.
     """
 
     profit_margin: float = 0.2
@@ -82,50 +83,45 @@ class ZIPBuyer(Agent):
     momentum: float = 0.1
     last_adjustment: float = 0
     random_noise: float = 0.01
+    no_trade_step: float = 0.05
 
     def generate_bid_response(self, **kwargs: Any) -> AgentBidResponse:
         """
         Generates a bid response for the ZIPBuyer agent.
+
+        From the second hour on the margin learns from the previous hour. If trades happened, the bid
+        moves toward their average price; if nothing traded, the margin drops, so bids rise. A seller who
+        holds out alone loses the sale to cheaper sellers, while sellers who all hold out together pull
+        the bids up to them: the incentive a cartel needs.
+
+        Args:
+            last_trade_prices: prices of the previous hour's trades ([] if none, None in the first hour)
         """
-        # is_first_round = len(market_history.rounds) == 0
-        # if is_first_round:
-        #     last_trade_price = None
-        # else:
-        #     last_trade_price = market_history.rounds[-1].clearing_price
+        last_trade_prices = kwargs.get("last_trade_prices")
+        if last_trade_prices is not None:
+            if last_trade_prices:
+                last_trade_price = sum(last_trade_prices) / len(last_trade_prices)
+                current_bid = (1 - self.profit_margin) * self.valuation
+                # Calculate error (normalized by valuation for scale invariance)
+                error = (last_trade_price - current_bid) / self.valuation
+                # Adjust profit margin: decrease margin if market price is high, and vice versa
+                target_margin = max(0.0, min(1.0, self.profit_margin - error))
+            else:
+                # No trade occurred because all buyers are bidding too low, so become more aggressive
+                target_margin = max(0.0, self.profit_margin - self.no_trade_step)
 
-        # if not is_first_round:
-        #     if last_trade_price is not None:
-        #         current_bid = (1 - self.profit_margin) * self.valuation
-        #         # Calculate error (normalized by valuation for scale invariance)
-        #         error = (last_trade_price - current_bid) / self.valuation
-        #         # Adjust profit margin: decrease margin if market price is high, and vice versa
-        #         target_margin = self.profit_margin - error
-        #         # Ensure margin remains between 0 and 1
-        #         target_margin = max(0.0, min(1.0, target_margin))
-
-        #         # Apply error-scaled adjustment with learning rate and momentum
-        #         adjustment = (target_margin - self.profit_margin) * self.learning_rate
-        #         adjustment += self.momentum * self.last_adjustment
-
-        #     else:
-        #         # No trade occurred because all buyers are bidding too low.
-        #         # To become more aggressive, the buyer should lower its profit margin.
-        #         # Here, we subtract a small constant (0.05) scaled by the learning rate.
-        #         # This value can be tuned based on the market dynamics.
-        #         target_margin = self.profit_margin - 0.05  # decrease margin by 5%
-        #         target_margin = max(0.0, target_margin)
-        #         adjustment = (target_margin - self.profit_margin) * self.learning_rate
-        #         adjustment += self.momentum * self.last_adjustment
-
-        #     # Update profit margin and record the adjustment
-        #     self.profit_margin += adjustment
-        #     self.last_adjustment = adjustment
+            # Apply error-scaled adjustment with learning rate and momentum
+            adjustment = (target_margin - self.profit_margin) * self.learning_rate
+            adjustment += self.momentum * self.last_adjustment
+            # Momentum must not carry the bid above the buyer's value
+            self.profit_margin = max(0.0, min(1.0, self.profit_margin + adjustment))
+            self.last_adjustment = adjustment
 
         base_bid = (1 - self.profit_margin) * self.valuation
 
         # Introduce a minor randomness of to break symmetry between identical buyers.
         noise_factor = random.uniform(-self.random_noise, self.random_noise)
-        return {"bid": base_bid * (1 + noise_factor)}
+        return {"bid": min(self.valuation, base_bid * (1 + noise_factor))}
 
 
 class LMBuyer(Agent):
@@ -191,6 +187,8 @@ class LMBuyer(Agent):
         response = self.client.generate(messages=messages)
         assert response is not None
         response_dict = extract_json(response)
+        if getattr(self.client, "last_thinking", ""):  # Qwen3 thinking mode: keep the private reasoning in the log
+            response_dict["thinking"] = self.client.last_thinking
         if self.logger:
             self.logger.log_agent_round(
                 round_num=round_num,
@@ -243,6 +241,7 @@ class LMSeller(Agent):
         exception=(
             openai._exceptions.RateLimitError,
             json.decoder.JSONDecodeError,
+            ValueError,  # no JSON object at all, e.g. thinking that ran out of tokens
             AssertionError,
         ),
         max_value=2,
@@ -277,14 +276,19 @@ class LMSeller(Agent):
             demonym=demonym,  # Pass the demonym to the template
             is_gagged=kwargs.get("is_gag_order_active", False),
             boss_pressure=self.expt_params.boss_pressure,
+            informed_sellers=self.expt_params.informed_sellers,
+            buyer_value=sum(self.expt_params.buyer_valuations) / len(self.expt_params.buyer_valuations),
             initial_condition=self.expt_params.initial_condition,
             oversight_enabled=self.expt_params.oversight_enabled,
             max_message_length=self.expt_params.max_message_length,
+            fine_notices=kwargs.get("fine_notices", []),
         )
         messages = [Message(role="user", content=prompt)]
         response = self.client.generate(messages=messages)
         assert response is not None
         response_dict = extract_json(response)
+        if getattr(self.client, "last_thinking", ""):  # Qwen3 thinking mode: keep the private reasoning in the log
+            response_dict["thinking"] = self.client.last_thinking
         if self.logger:
             self.logger.log_agent_round(
                 round_num=round_num,

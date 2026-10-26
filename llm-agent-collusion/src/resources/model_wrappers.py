@@ -9,13 +9,20 @@ Hackathon standard: every model call goes through **OpenRouter** with one
 ``gpt-4.1``, resolves to ``openai/gpt-4.1``.
 
 Set ``LLM_BASE_URL`` to point the client at another OpenAI-compatible server (a local
-Ollama, a mock in tests). The original direct-SDK clients (OpenAI, Anthropic, Vertex AI)
+Ollama, a mock in tests). To serve several models from local vLLM servers at once, set
+``LLM_ENDPOINTS`` to a JSON map from model id to base URLs, e.g.
+``{"Qwen/Qwen3-32B-FP8": ["http://localhost:8001/v1", "http://localhost:8002/v1"]}``; each client
+(one per agent) sticks to one URL so the server's prefix cache keeps that agent's history warm.
+The original direct-SDK clients (OpenAI, Anthropic, Vertex AI)
 are kept below behind ``LLM_PROVIDER=openai|anthropic|google`` for reproduction only; their
 SDKs are optional extras and imported lazily.
 """
 
 from abc import ABC, abstractmethod
+from functools import lru_cache
+from itertools import count
 from typing import List, Optional, TypedDict
+import json
 import logging
 import os
 import time
@@ -27,6 +34,16 @@ from poseidon_compute import make_client, resolve_model
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
+
+# Offset by PID so parallel simulation processes spread their agents over the servers
+_endpoint_counter = count(os.getpid())
+
+
+@lru_cache(maxsize=1)
+def local_endpoints() -> dict[str, list[str]]:
+    """LLM_ENDPOINTS: model id -> base URLs of local OpenAI-compatible servers (see module docstring)."""
+    raw = os.getenv("LLM_ENDPOINTS")
+    return {model: [urls] if isinstance(urls, str) else urls for model, urls in json.loads(raw).items()} if raw else {}
 
 
 class Message(TypedDict):
@@ -93,24 +110,32 @@ class OpenRouterClient(ModelWrapper):
     def __init__(self, model_name: str, **kwargs):
         super().__init__(model_name, **kwargs)
         self.model_name = resolve_model(model_name)
-        self.client = make_client(timeout=120)
+        urls = local_endpoints().get(self.model_name)
+        if urls:
+            # Long timeout: a busy local server queues requests instead of rate-limiting them
+            url = urls[next(_endpoint_counter) % len(urls)]
+            self.client = OpenAI(base_url=url, api_key=os.getenv("LLM_API_KEY") or "EMPTY", timeout=900)
+        else:
+            self.client = make_client(timeout=120)
         self.is_remote = "localhost" not in str(self.client.base_url) and "127.0.0.1" not in str(self.client.base_url)
 
-    def generate(self, messages: List[Message]) -> Optional[str]:
-        params = dict(self.additional_params)
+    def generate(self, messages: List[Message], **overrides) -> Optional[str]:
+        """``overrides`` replace request parameters for this call only; a value of None drops the parameter."""
+        params = {"temperature": self.temperature, "max_tokens": self.max_tokens, "top_p": self.top_p,
+                  **self.additional_params, **overrides}
+        params = {k: v for k, v in params.items() if v is not None}
         for attempt in range(self.max_retries):
             try:
                 response = self.client.chat.completions.create(
                     model=self.model_name,
                     messages=messages,
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
-                    top_p=self.top_p,
                     **params,
                 )
                 content = response.choices[0].message.content or ""
-                if "</think>" in content:  # reasoning models: keep only the answer
-                    content = content.rsplit("</think>", 1)[1]
+                self.last_thinking = ""
+                if "</think>" in content:  # reasoning models: keep only the answer, and the thinking for the logs
+                    thinking, content = content.rsplit("</think>", 1)
+                    self.last_thinking = thinking.replace("<think>", "").strip()
                 return content
             except BadRequestError as e:
                 if "response_format" in params and "response_format" in str(e).lower():

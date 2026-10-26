@@ -7,19 +7,31 @@ import numpy as np
 import os
 
 from src.continuous_double_auction.cda_types import resolve_model
-from src.resources.model_wrappers import ModelWrapper
+from src.resources.model_wrappers import ModelWrapper, local_endpoints
 
 
-def get_client(model: str, temperature: float, **kwargs) -> ModelWrapper:
+def get_client(model: str, temperature: float, enable_thinking: bool = False, **kwargs) -> ModelWrapper:
     """
     Build a model client. Default route is OpenRouter (one key); the paper's model
     names are aliases resolved by ``resolve_model``. JSON mode is requested and dropped
-    automatically for models that do not support it.
+    automatically for models that do not support it. Models listed in LLM_ENDPOINTS go to
+    local vLLM servers instead (see model_wrappers).
     """
     provider = os.getenv("LLM_PROVIDER", "openrouter").lower()
     if provider == "openrouter":
         kwargs.setdefault("response_format", {"type": "json_object"})
-        return ModelWrapper.create(resolve_model(model), temperature=temperature, **kwargs)
+        model_id = resolve_model(model)
+        if model_id in local_endpoints():
+            # vLLM seeds each request separately, so one run-wide seed would replay the same sampling noise
+            kwargs.pop("seed", None)
+            if "qwen3" in model_id.lower():
+                kwargs.setdefault("extra_body", {"chat_template_kwargs": {"enable_thinking": enable_thinking}})
+                if enable_thinking:
+                    # JSON mode would constrain the thinking too (the servers run without a reasoning parser),
+                    # and thinking needs room before the answer
+                    kwargs.pop("response_format")
+                    kwargs.setdefault("max_tokens", 8000)
+        return ModelWrapper.create(model_id, temperature=temperature, **kwargs)
     # legacy direct SDKs (reproduction only)
     if provider == "openai":
         kwargs.setdefault("response_format", {"type": "json_object"})
